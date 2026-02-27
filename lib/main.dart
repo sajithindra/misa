@@ -1,7 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:camera/camera.dart';
+import 'streaming_page.dart';
 
-void main() {
+late List<CameraDescription> _cameras;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    _cameras = await availableCameras();
+  } catch (e) {
+    _cameras = [];
+    debugPrint('Camera error: $e');
+  }
   runApp(const MyApp());
 }
 
@@ -59,9 +70,11 @@ class LoginPage extends StatelessWidget {
             const SizedBox(height: 60),
             InkWell(
               onTap: () {
-                print('success');
+                debugPrint('success');
                 Navigator.of(context).push(
-                  MaterialPageRoute(builder: (context) => const HomePage()),
+                  MaterialPageRoute(
+                    builder: (context) => StreamingPage(cameras: _cameras),
+                  ),
                 );
               },
               borderRadius: BorderRadius.circular(8),
