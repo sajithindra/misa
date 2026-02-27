@@ -1,7 +1,10 @@
-import 'dart:async';
-import 'dart:convert';
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import 'package:intl/intl.dart';
+import 'notification_service.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 class StreamingPage extends StatefulWidget {
@@ -13,18 +16,16 @@ class StreamingPage extends StatefulWidget {
 }
 
 class _StreamingPageState extends State<StreamingPage> {
+  static const platform = MethodChannel('com.example.misa/camera');
   CameraController? _controller;
   WebSocketChannel? _channel;
-  Timer? _timer;
   bool _isConnected = false;
+  bool _isProcessingFrame = false;
 
-  // Defaulting to 10.0.2.2 which is the Android emulator's alias to localhost.
-  // iOS simulator uses localhost directly. You can edit this.
-  final TextEditingController _urlController = TextEditingController(
-    text: 'ws://10.0.2.2:8000/ws/stream/mobile_app_stream_1',
+  // Default connection IP address for the streaming server
+  final TextEditingController _ipController = TextEditingController(
+    text: '172.20.25.16',
   );
-
-  final List<String> _alerts = [];
 
   @override
   void initState() {
@@ -40,6 +41,9 @@ class _StreamingPageState extends State<StreamingPage> {
         camera,
         ResolutionPreset.medium,
         enableAudio: false,
+        imageFormatGroup: defaultTargetPlatform == TargetPlatform.iOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.yuv420,
       );
 
       _controller!
@@ -64,34 +68,27 @@ class _StreamingPageState extends State<StreamingPage> {
 
   void _connect() {
     try {
-      final uri = Uri.parse(_urlController.text);
+      final ip = _ipController.text.trim();
+      final uriStr = 'ws://$ip:8000/ws/stream';
+      final uri = Uri.parse(uriStr);
       _channel = WebSocketChannel.connect(uri);
 
       setState(() {
         _isConnected = true;
-        _alerts.insert(0, 'Connected to server: ${uri.toString()}');
       });
+
+      // Also connect to alerts via NotificationService
+      context.read<NotificationService>().connect(ip);
 
       _channel!.stream.listen(
         (message) {
-          debugPrint('Server alert: $message');
-          if (mounted) {
-            setState(() {
-              _alerts.insert(0, 'Alert: $message');
-              if (_alerts.length > 50) _alerts.removeLast();
-            });
-          }
+          debugPrint('Server stream message: $message');
         },
         onDone: () {
           _disconnect();
         },
         onError: (error) {
           debugPrint('WebSocket error: $error');
-          if (mounted) {
-            setState(() {
-              _alerts.insert(0, 'Error: $error');
-            });
-          }
           _disconnect();
         },
       );
@@ -99,152 +96,339 @@ class _StreamingPageState extends State<StreamingPage> {
       _startStreaming();
     } catch (e) {
       debugPrint('Connection failed: $e');
-      setState(() {
-        _alerts.insert(0, 'Connection failed: $e');
-      });
     }
   }
 
   void _disconnect() {
-    _timer?.cancel();
+    if (_controller?.value.isStreamingImages == true) {
+      _controller?.stopImageStream();
+    }
     _channel?.sink.close();
+    context.read<NotificationService>().disconnect();
     if (mounted) {
       setState(() {
         _isConnected = false;
-        _alerts.insert(0, 'Disconnected');
       });
     }
   }
 
   void _startStreaming() {
-    // Take and send a picture every 500 milliseconds (2 FPS)
-    _timer = Timer.periodic(const Duration(milliseconds: 500), (timer) async {
-      if (_controller != null &&
-          _controller!.value.isInitialized &&
-          !_controller!.value.isTakingPicture) {
+    if (_controller == null || !_controller!.value.isInitialized) return;
+
+    // Track FPS locally to allow for potential throttling, though we'll aim for as many as possible natively
+    int timeSinceLastFrame = DateTime.now().millisecondsSinceEpoch;
+
+    try {
+      _controller!.startImageStream((CameraImage image) async {
+        if (_isProcessingFrame || !_isConnected) return;
+
+        // Throttling to max 30 FPS (~33ms per frame) to not overwhelm system/network
+        int now = DateTime.now().millisecondsSinceEpoch;
+        if (now - timeSinceLastFrame < 33) return;
+
+        timeSinceLastFrame = now;
+        _isProcessingFrame = true;
+
         try {
-          final XFile file = await _controller!.takePicture();
-          final bytes = await file.readAsBytes();
+          Uint8List? processedBytes;
 
-          // Send as base64
-          final base64String = base64Encode(bytes);
-          _channel?.sink.add(base64String);
+          if (defaultTargetPlatform == TargetPlatform.android) {
+            final planes = image.planes.map((plane) {
+              return {
+                'bytes': plane.bytes,
+                'bytesPerRow': plane.bytesPerRow,
+                'bytesPerPixel': plane.bytesPerPixel,
+              };
+            }).toList();
 
-          debugPrint('Sent frame: ${base64String.length} chars');
+            final result = await platform.invokeMethod('compressFrame', {
+              'platform': 'android',
+              'planes': planes,
+              'width': image.width,
+              'height': image.height,
+              'targetWidth': 480,
+            });
+            processedBytes = result as Uint8List?;
+          } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+            final plane = image.planes[0];
+            final result = await platform.invokeMethod('compressFrame', {
+              'platform': 'ios',
+              'bytes': plane.bytes,
+              'bytesPerRow': plane.bytesPerRow,
+              'width': image.width,
+              'height': image.height,
+              'targetWidth': 480,
+            });
+            processedBytes = result as Uint8List?;
+          }
+
+          if (processedBytes != null && _isConnected) {
+            _channel?.sink.add(processedBytes);
+            // debugPrint('Sent frame: ${processedBytes.length} bytes');
+          }
         } catch (e) {
-          debugPrint('Error capturing/sending frame: $e');
+          debugPrint('Error streaming frame: $e');
+        } finally {
+          _isProcessingFrame = false;
         }
-      }
-    });
+      });
+    } catch (e) {
+      debugPrint("Could not start image stream: $e");
+    }
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
+    if (_controller?.value.isStreamingImages == true) {
+      _controller?.stopImageStream();
+    }
     _channel?.sink.close();
     _controller?.dispose();
-    _urlController.dispose();
+    _ipController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Camera Stream')),
-      body: Column(
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
         children: [
-          // Camera Preview Area
+          // 1. Full Screen Camera Background
           if (_controller != null && _controller!.value.isInitialized)
-            Expanded(
-              flex: 3,
-              child: AspectRatio(
-                aspectRatio: _controller!.value.aspectRatio,
+            FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: _controller!.value.previewSize?.height ?? 1,
+                height: _controller!.value.previewSize?.width ?? 1,
                 child: CameraPreview(_controller!),
               ),
             )
           else
-            const Expanded(
-              flex: 3,
-              child: Center(child: Text('Initializing Camera...')),
-            ),
+            const Center(child: CircularProgressIndicator(color: Colors.white)),
 
-          // Controls Area
-          Padding(
-            padding: const EdgeInsets.all(16.0),
+          // 2. Safe Area UI Overlay
+          SafeArea(
             child: Column(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                TextField(
-                  controller: _urlController,
-                  decoration: const InputDecoration(
-                    labelText: 'WebSocket URL',
-                    border: OutlineInputBorder(),
-                    filled: true,
-                    fillColor: Colors.black54,
+                // Top Header (Optional subtle back button)
+                Align(
+                  alignment: Alignment.topLeft,
+                  child: IconButton(
+                    icon: const Icon(Icons.arrow_back, color: Colors.white70),
+                    onPressed: () => Navigator.of(context).pop(),
                   ),
-                  enabled: !_isConnected,
-                  style: const TextStyle(color: Colors.white),
                 ),
-                const SizedBox(height: 16),
-                SizedBox(
-                  width: double.infinity,
-                  height: 50,
-                  child: ElevatedButton(
-                    onPressed: _toggleConnection,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _isConnected ? Colors.red : Colors.green,
-                      foregroundColor: Colors.white,
+
+                // Bottom Control Panel
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 24,
+                  ),
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [Colors.black87, Colors.transparent],
+                      begin: Alignment.bottomCenter,
+                      end: Alignment.topCenter,
+                      stops: [0.3, 1.0],
                     ),
-                    child: Text(
-                      _isConnected ? 'STOP STREAMING' : 'CONNECT & STREAM',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 16,
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // IP Address Input
+                      Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.2),
+                          ),
+                        ),
+                        child: TextField(
+                          controller: _ipController,
+                          enabled: !_isConnected,
+                          keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true,
+                          ),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          textAlign: TextAlign.center,
+                          decoration: InputDecoration(
+                            border: InputBorder.none,
+                            contentPadding: const EdgeInsets.symmetric(
+                              vertical: 16,
+                            ),
+                            hintText: 'Enter Server IP',
+                            hintStyle: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.5),
+                              fontSize: 16,
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
+                      const SizedBox(height: 20),
+
+                      // Connect / Stream Toggle Button
+                      SizedBox(
+                        width: double.infinity,
+                        height: 56,
+                        child: ElevatedButton(
+                          onPressed: _toggleConnection,
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _isConnected
+                                ? Colors.redAccent
+                                : Colors.white,
+                            foregroundColor: _isConnected
+                                ? Colors.white
+                                : Colors.black87,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            elevation: 0,
+                          ),
+                          child: Text(
+                            _isConnected ? 'STOP STREAMING' : 'START STREAM',
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 1.2,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
             ),
           ),
 
-          // Output Alerts Area
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 16.0),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                'Server Alerts:',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Expanded(
-            flex: 2,
-            child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.white24),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: ListView.builder(
-                padding: const EdgeInsets.all(8),
-                itemCount: _alerts.length,
-                itemBuilder: (context, index) => Padding(
-                  padding: const EdgeInsets.only(bottom: 4.0),
-                  child: Text(
-                    _alerts[index],
-                    style: const TextStyle(
-                      fontSize: 14,
-                      color: Colors.greenAccent,
+          // Live Indicator overlaid on video when connected
+          if (_isConnected)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 16,
+              right: 20,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.redAccent.withValues(alpha: 0.8),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.circle, color: Colors.white, size: 12),
+                    SizedBox(width: 8),
+                    Text(
+                      'LIVE 30FPS',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                        letterSpacing: 1.0,
+                      ),
                     ),
-                  ),
+                  ],
                 ),
               ),
             ),
-          ),
+
+          // 4. Alerts Overlay
+          _buildAlertsOverlay(),
         ],
       ),
+    );
+  }
+
+  Widget _buildAlertsOverlay() {
+    return Consumer<NotificationService>(
+      builder: (context, notificationService, child) {
+        if (notificationService.alerts.isEmpty) return const SizedBox.shrink();
+
+        return Positioned(
+          top: MediaQuery.of(context).padding.top + 60,
+          left: 20,
+          right: 20,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: notificationService.alerts.take(3).map((alert) {
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8.0),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withValues(alpha: 0.9),
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.3),
+                        blurRadius: 8,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.warning_amber_rounded,
+                        color: Colors.white,
+                        size: 28,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  alert.type,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                                Text(
+                                  DateFormat(
+                                    'HH:mm:ss',
+                                  ).format(alert.timestamp),
+                                  style: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.7),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              alert.message,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        );
+      },
     );
   }
 }

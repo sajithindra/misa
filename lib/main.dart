@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:camera/camera.dart';
+import 'package:provider/provider.dart';
+import 'notification_service.dart';
 import 'streaming_page.dart';
 
 late List<CameraDescription> _cameras;
@@ -13,7 +15,16 @@ Future<void> main() async {
     _cameras = [];
     debugPrint('Camera error: $e');
   }
-  runApp(const MyApp());
+
+  final notificationService = NotificationService();
+  await notificationService.init();
+
+  runApp(
+    ChangeNotifierProvider(
+      create: (_) => notificationService,
+      child: const MyApp(),
+    ),
+  );
 }
 
 class MyApp extends StatelessWidget {
