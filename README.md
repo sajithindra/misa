@@ -1,17 +1,21 @@
-# misa
+# Misa - Real-Time Safety Intelligence App
 
-The android app for the ryik.ai project
+**Team Name:** Palantir  
+**Team Members:** Sajith Surendran, Jobin Mathew  
 
-## Getting Started
+## About Our Platform
 
-This project is a starting point for a Flutter application.
+Our platform is an agentic AI-powered real-time safety intelligence system built to protect people at scale. It integrates CCTV networks, drone feeds, and live video streams to detect and identify individuals who appear on authorized watchlists, such as repeat offenders or organized fraud networks.
 
-A few resources to get you started if this is your first Flutter project:
+What makes the system agentic is not just recognition, but autonomous coordination. The AI continuously observes multiple camera feeds, links identities across locations, tracks movement patterns, builds situational timelines, and generates structured intelligence reports without waiting for step-by-step human commands. It determines when to escalate, when to continue monitoring, and when to request operator validation. The system operates as a goal-driven security agent: prevent harm, minimize response time, and maintain traceable documentation.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+This platform is built for dense residential communities, apartments, campuses, enterprises, and child-focused institutions. In India alone, millions live in gated communities and high-density housing clusters where shared spaces increase exposure risk.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## What's in this Repository?
+
+This repository contains **Misa**, the Flutter-based mobile client application for the platform. It serves as the mobile edge interface for operators and field personnel. 
+
+Key features implemented in this repository include:
+- **Real-Time Camera Streaming:** Captures live video feeds from the mobile device and streams them efficiently over WebSocket to the central backend.
+- **Threat Alert Notifications:** Integrates a local notification service to deliver immediate, contextual alerts when the AI identifies persons of interest or requests operator validation.
+- **Cross-Platform Support:** Built with Flutter, enabling deployment across Android and iOS devices for security personnel on the ground.
